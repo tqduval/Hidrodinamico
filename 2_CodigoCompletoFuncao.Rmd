@@ -1,0 +1,205 @@
+# Trabalho 2 - Hidráulica Aplicada
+
+*Universiade de Brasília (ENC/PTARH)*
+
+*Tomás Antonio*
+
+Este código consiste no segundo trabalho da disciplina de Hidráulica Aplicada no Programa de Tecnologias Ambientais em Recursos Hídricos da Universidade de Brasília.
+
+O trabalho tem o objetivo de simular um canal com um hidrograma de cheia e uma curva-chave ao final, aplicando o **Método das Características** para resolver as **Equações de Saint-Venant**.
+
+## Pacotes
+
+```{r}
+# PACOTES -----------------------------------------------------------------
+pacman::p_load(pacman, ggplot2, tidyverse, magick, gganimate, optimx)
+```
+
+## Funções auxiliares
+
+```{r}
+# INTERPOLAÇÃO ------------------------------------------------------------
+
+# Função para interpolar o hidrograma conforme um intervalo de tempo Δt especificado
+fun.interpolar.hidrograma <- function(df.hidrograma,    # dataframe com duas colunas 't' e 'q'
+                                      dt,               # intervalo de tempo Δt [min]
+                                      metodo = "linear" # método de interpolação
+                                      ){
+  
+  # Cria a função de interpolação
+  interpolacao <- approxfun(x = df.hidrograma$t,
+                            y = df.hidrograma$q,
+                            method = metodo,
+                            rule = 2) # mantém o último valor p/ extrapolação
+  
+  # Gera uma sequência de tempo discretizada em 'dt'
+  t <- seq(from = 0, to = max(df.hidrograma$t), by = dt)
+  
+  # Garante que o último ponto (70 min) seja incluído
+  if (max(t) < max(df.hidrograma$t)) {
+    t <- c(t, max(df.hidrograma$t))
+  }
+  
+  # Calcula vazões interpoladas
+  q <- interpolacao(t)
+  
+  # Resultado
+  return(data.frame(t = t, q = q))
+  
+}
+
+
+# CHEZY -------------------------------------------------------------------
+
+# Função objetivo de Chézy para ser minimizada pelo optimx
+fun.chezy <- function(y, vazao, c.chezy, largura, decl){
+  
+  # Variáveis  
+  q.hidro <- vazao  # vazão
+  b <- largura      # largura do canal
+  i.f <- decl       # declividade da linha de energia
+  a <- b*y          # área molhada
+  rh <- a/(2*y + b) # raio hidráulico
+  
+  # Vazão pela fórmula de chézy
+  q.chezy <- c.chezy*a*sqrt(rh*i.f)
+  
+  # Definir função objetivo p/ encotrar a raiz
+  fo <- q.hidro - q.chezy
+  
+  return(fo) 
+  
+}
+
+
+# CARACTERÍSTICA NEGATIVA -------------------------------------------------
+
+#  Função objetivo da característica negativa p/ ser minimzada e encontrar yp
+fun.yp.montante <- function(par = c(NA),
+                            vazao,
+                            celeridade,
+                            velocidade.s,
+                            prof.s,
+                            prof.m,
+                            largura,
+                            velocidade.m,
+                            vazao.lateral,
+                            decl.energia.m,
+                            decl.canal,
+                            dt){
+  
+  # Variáveis
+  yp <- par[1]
+  q <- vazao
+  b <- largura
+  cm <- celeridade
+  vs <- velocidade.s
+  vm <- velocidade.m
+  ys <- prof.s
+  ym <- prof.m
+  ql <- vazao.lateral
+  g <- 9.81
+  ifm <- decl.energia.m
+  i0 <- decl.canal
+  am <- b*ym
+  
+  # Função de característica negativa c/ yp = q/(b*vp) substituída
+  fo <- q/(yp*b) - vs - g/cm*(yp - ys) + ql/am*(vm + cm)*dt + g*(ifm - i0)*dt
+  
+  return(fo)
+  
+}
+
+# Curva-chave
+fun.yp.jusante <- function(par = c(NA),
+                           celeridade,
+                           velocidade.r,
+                           prof.r,
+                           prof.m,
+                           largura,
+                           velocidade.m,
+                           vazao.lateral,
+                           decl.energia.m,
+                           decl.canal,
+                           dt){
+  
+  # Variáveis
+  yp <- par[1]
+  b <- largura
+  cm <- celeridade
+  vr <- velocidade.r
+  vm <- velocidade.m
+  yr <- prof.r
+  ym <- prof.m
+  ql <- vazao.lateral
+  g <- 9.81
+  ifm <- decl.energia.m
+  i0 <- decl.canal
+  am <- b*ym
+  
+  # Função de característica positiva c/ curva chave subsituída em vp
+  fo <- 111.7118*(yp - 0.3848)^1.2277/(b*yp) - vr + g/cm*(yp - yr) + ql/am*(vm - cm)*dt + g*(ifm - i0)*dt
+  
+  return(fo)
+  
+}
+```
+
+## Função principal
+
+```{r}
+# SIMULAÇÃO ---------------------------------------------------------------
+fun.hidrodinamico <- function(df.hidrograma,     # df c/ t [s] e q [m³/s]
+                              comprimento.canal, # [m]
+                              largura,           # [m]
+                              declividade.fundo, # [m/m]              
+                              c.chezy,           # coef. rugosidade Chézy
+                              vazao.lateral,     # [m³/s.m]
+                              tempo.simulacao,   # [s]
+                              passo.tempo,       # [s] devem ser satisfeitas as condições do critério de Courant
+                              passo.espaco       # [m] devem ser satisfeitas as condições do critério de Courant
+                              ){
+  
+  # Iniciar contador de tempo
+  tempo.inicio <- Sys.time()
+  
+  # Pacotes
+  if (!require("pacman")) install.packages("pacman")
+  p_load(pacman, tidyverse, beepr)
+  
+  # Renomear parâmetros
+  b <- largura
+  l <- comprimento.canal
+  i0 <- declividade.fundo
+  ql <- vazao.lateral
+  t.sim <- tempo.simulacao
+  dt <- passo.tempo
+  dx <- passo.espaco
+  g <- 9.81 # gravidade [m/s²]
+  
+  # CONDIÇÕES DE FRONTEIRA
+
+  # Montante: hidrograma de entrada 'df.hidrograma' e característica negativa
+  # Jusante: curva-chave do canal 'fun.curva.chave' e característica positiva
+  
+  # DISCRETIZAÇÃO
+  
+  # Temporal
+  # Total de passos no tempo
+  n.dt <- t.sim/dt
+  
+  # Espacial
+  
+  
+}
+```
+
+## Aplicação da função
+
+Antes da aplicação de `fun.hidrodinamico`, devemos testar os passos a serem adotados em função do critério de Courant:
+
+$$
+\Delta x \leq \frac{\Delta t}{|v| + c}
+$$
+
+Nesse caso, se quisermos determinar $$ \Delta t $$, teremos que $$ \Delta t \geq \Delta x \;(|v| + c) $$. Então, caso se quisermos usar $$ \Delta t = 10 \; s$$ e $$ \Delta x = 10 \; s$$
